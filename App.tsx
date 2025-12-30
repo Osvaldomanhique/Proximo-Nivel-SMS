@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { Layout } from './components/Layout';
 import { AppTab, Contact, DeliveryStatus, SMSLog, CampaignStats } from './types';
 import { 
@@ -15,7 +15,9 @@ import {
   ExternalLink,
   Smartphone,
   Info,
-  History // Added missing icon import to fix conflict with global History interface
+  History,
+  Timer,
+  RefreshCw
 } from 'lucide-react';
 import { optimizeMessage } from './services/geminiService';
 
@@ -24,7 +26,7 @@ const App: React.FC = () => {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [fileName, setFileName] = useState<string | null>(null);
   const [message, setMessage] = useState('');
-  const [delay, setDelay] = useState(5.0);
+  const [delay, setDelay] = useState(10.0); // Padrão 10s para segurança
   const [isSending, setIsSending] = useState(false);
   const [logs, setLogs] = useState<SMSLog[]>([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
@@ -32,26 +34,26 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sendingRef = useRef(false);
 
-  // Derived Stats
-  const stats: CampaignStats = {
+  // Stats
+  const stats: CampaignStats = useMemo(() => ({
     total: contacts.length,
-    sent: logs.filter(l => l.status === DeliveryStatus.SENT || l.status === DeliveryStatus.DELIVERED).length,
+    sent: logs.filter(l => l.status === DeliveryStatus.SENT).length,
     failed: logs.filter(l => l.status === DeliveryStatus.FAILED).length,
     remaining: contacts.length - logs.length
-  };
+  }), [contacts, logs]);
 
-  // Duration Calculator
-  const calculateTotalTime = () => {
-    const totalSeconds = contacts.length * delay;
+  // Campaign Duration Calc
+  const campaignTime = useMemo(() => {
+    const totalSeconds = (isSending ? stats.remaining : contacts.length) * delay;
     const h = Math.floor(totalSeconds / 3600);
     const m = Math.floor((totalSeconds % 3600) / 60);
     const s = Math.floor(totalSeconds % 60);
     
     return {
-      formatted: `${h > 0 ? h + 'h ' : ''}${m > 0 ? m + 'm ' : ''}${s}s`,
-      seconds: totalSeconds
+      text: `${h > 0 ? h + 'h ' : ''}${m > 0 ? m + 'm ' : ''}${s}s`,
+      totalSeconds
     };
-  };
+  }, [contacts.length, delay, isSending, stats.remaining]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -60,19 +62,23 @@ const App: React.FC = () => {
     setFileName(file.name);
     const reader = new FileReader();
     reader.onload = (e) => {
-      const text = e.target?.result as string;
-      const lines = text.split('\n').filter(line => line.trim() !== '');
-      const parsedContacts: Contact[] = lines.map((line, index) => {
-        const parts = line.split(',');
-        return {
-          id: `c-${index}`,
-          phone: parts[0]?.trim() || '',
-          name: parts[1]?.trim() || 'Cliente'
-        };
-      }).filter(c => c.phone !== '');
-      
-      setContacts(parsedContacts);
-      setLogs([]); 
+      try {
+        const text = e.target?.result as string;
+        const lines = text.split('\n').filter(line => line.trim() !== '');
+        const parsedContacts: Contact[] = lines.map((line, index) => {
+          const parts = line.split(',');
+          return {
+            id: `c-${index}`,
+            phone: parts[0]?.trim() || '',
+            name: parts[1]?.trim() || 'Cliente'
+          };
+        }).filter(c => c.phone !== '');
+        
+        setContacts(parsedContacts);
+        setLogs([]);
+      } catch (err) {
+        alert("Erro ao ler arquivo CSV. Certifique-se que o formato é: Telefone, Nome");
+      }
     };
     reader.readAsText(file);
   };
@@ -83,12 +89,14 @@ const App: React.FC = () => {
     setIsSending(true);
     sendingRef.current = true;
 
-    for (let i = 0; i < contacts.length; i++) {
+    const contactsToSend = [...contacts];
+
+    for (let i = 0; i < contactsToSend.length; i++) {
       if (!sendingRef.current) break;
 
-      const contact = contacts[i];
+      const contact = contactsToSend[i];
       const newLog: SMSLog = {
-        id: Math.random().toString(36).substr(2, 9),
+        id: Math.random().toString(36).substring(2, 11),
         recipient: contact.phone,
         message: message.replace('[Nome]', contact.name || 'Cliente'),
         status: DeliveryStatus.PENDING,
@@ -99,12 +107,44 @@ const App: React.FC = () => {
 
       await new Promise(resolve => setTimeout(resolve, delay * 1000));
 
-      const success = Math.random() > 0.02; // Simulação de alta taxa de sucesso do SIM
+      const success = Math.random() > 0.05; // 5% de chance de erro simulado
       
       setLogs(prev => prev.map(log => 
         log.id === newLog.id 
-          ? { ...log, status: success ? DeliveryStatus.SENT : DeliveryStatus.FAILED, error: success ? undefined : 'Falha no Gateway SIM' } 
+          ? { ...log, status: success ? DeliveryStatus.SENT : DeliveryStatus.FAILED } 
           : log
+      ));
+    }
+
+    setIsSending(false);
+    sendingRef.current = false;
+  };
+
+  const resendFailed = async () => {
+    if (isSending || stats.failed === 0) return;
+
+    setIsSending(true);
+    sendingRef.current = true;
+
+    const failedLogs = logs.filter(l => l.status === DeliveryStatus.FAILED);
+
+    for (const failedLog of failedLogs) {
+      if (!sendingRef.current) break;
+
+      // Resetar para Pendente antes de tentar enviar
+      setLogs(prev => prev.map(l => 
+        l.id === failedLog.id ? { ...l, status: DeliveryStatus.PENDING, timestamp: new Date().toLocaleTimeString() } : l
+      ));
+
+      await new Promise(resolve => setTimeout(resolve, delay * 1000));
+
+      const success = Math.random() > 0.05;
+      
+      setLogs(prev => prev.map(l => 
+        l.id === failedLog.id 
+          ? { ...l, status: success ? DeliveryStatus.SENT : DeliveryStatus.FAILED } 
+          // Fix: changed 'log' to 'l' to match the map callback parameter
+          : l
       ));
     }
 
@@ -117,197 +157,196 @@ const App: React.FC = () => {
     setIsSending(false);
   };
 
-  const handleOptimize = async () => {
-    if (!message) return;
-    setIsOptimizing(true);
-    const result = await optimizeMessage(message, "Vendas e Fidelização");
-    if (result) {
-      setMessage(result.optimizedMessage);
-    }
-    setIsOptimizing(false);
-  };
-
   return (
     <Layout activeTab={activeTab} setActiveTab={setActiveTab}>
       {activeTab === 'home' && (
-        <div className="p-4 space-y-6">
+        <div className="space-y-6 animate-in fade-in duration-500 pb-10">
           
-          {/* Google Messages Connection Card */}
-          <div className="bg-slate-800/80 border border-blue-500/30 rounded-2xl p-4 overflow-hidden relative group">
-             <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
-                <Smartphone className="w-16 h-16 text-blue-400 rotate-12" />
-             </div>
-             <div className="relative z-10 flex flex-col gap-3">
-                <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-                  <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest">Gateway Google Ativo</span>
+          {/* Conexão Google Messages */}
+          <section className="bg-blue-600/10 border border-blue-500/20 rounded-3xl p-5 flex flex-col gap-4">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-blue-600 rounded-2xl flex items-center justify-center shadow-lg shadow-blue-500/20">
+                  <Smartphone className="w-6 h-6 text-white" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-bold text-white">Conexão Google Mensagens</h3>
-                  <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                    Utilizando seu chip (SIM) através do navegador para envios nativos.
-                  </p>
+                  <h3 className="text-sm font-black text-white uppercase tracking-tight">Gateway SIM Conectado</h3>
+                  <p className="text-[10px] text-blue-400/80 font-bold uppercase tracking-widest">Google Messages Sync</p>
                 </div>
-                <a 
-                  href="https://messages.google.com/web/conversations" 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  className="w-fit flex items-center gap-2 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/40 border border-blue-500/50 rounded-lg transition-all"
-                >
-                  <span className="text-[10px] font-bold text-blue-400">ABRIR PAINEL GOOGLE</span>
-                  <ExternalLink className="w-3 h-3 text-blue-400" />
-                </a>
-             </div>
-          </div>
+              </div>
+              <div className="flex items-center gap-1.5 bg-emerald-500/20 px-2 py-1 rounded-full">
+                <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></div>
+                <span className="text-[9px] font-black text-emerald-400">ATIVO</span>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              O sistema disparará mensagens usando o chip do seu celular conectado ao navegador.
+            </p>
+            <a 
+              href="https://messages.google.com/web/conversations" 
+              target="_blank" 
+              className="flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-white text-[11px] font-black py-3 rounded-xl transition-all border border-slate-700"
+            >
+              ABRIR PAINEL DE PAREAMENTO GOOGLE
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </section>
 
-          {/* Import Section */}
+          {/* Importação de Planilha */}
           <div className="space-y-3">
+            <label className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] ml-1">Banco de Dados</label>
             <button 
               onClick={() => fileInputRef.current?.click()}
-              className="w-full h-24 border-2 border-dashed border-slate-700 hover:border-blue-500 hover:bg-blue-500/5 rounded-2xl flex flex-col items-center justify-center transition-all group bg-slate-900"
+              className="w-full bg-slate-900 border-2 border-dashed border-slate-800 hover:border-blue-500/50 hover:bg-blue-500/5 rounded-3xl py-8 flex flex-col items-center gap-3 transition-all group"
             >
-              <div className="w-8 h-8 bg-slate-800 text-slate-400 rounded-lg flex items-center justify-center mb-2 group-hover:text-blue-500 group-hover:bg-blue-500/10 transition-colors">
-                <Upload className="w-4 h-4" />
+              <div className="w-12 h-12 bg-slate-800 rounded-2xl flex items-center justify-center group-hover:scale-110 transition-transform">
+                <Upload className="w-5 h-5 text-slate-400 group-hover:text-blue-500" />
               </div>
-              <p className="text-xs font-bold text-slate-300">
-                {fileName ? fileName : 'Carregar Planilha de Contatos'}
-              </p>
-              <p className="text-[9px] text-slate-500 uppercase tracking-widest mt-1">Clique para selecionar .csv</p>
+              <div className="text-center">
+                <p className="text-xs font-black text-slate-300 uppercase tracking-tight">
+                  {fileName ? fileName : 'Importar Lista de Envios'}
+                </p>
+                <p className="text-[9px] text-slate-500 mt-1 uppercase font-bold tracking-widest">Arraste ou clique para carregar .CSV</p>
+              </div>
             </button>
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              className="hidden" 
-              accept=".csv"
-              onChange={handleFileUpload}
-            />
-            {contacts.length > 0 && (
-              <div className="flex items-center gap-2 px-3 py-2 bg-emerald-500/5 border border-emerald-500/20 rounded-xl">
-                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-500" />
-                <span className="text-[11px] text-emerald-400 font-bold">
-                  {contacts.length} contatos carregados com sucesso
-                </span>
-              </div>
-            )}
+            <input type="file" ref={fileInputRef} className="hidden" accept=".csv" onChange={handleFileUpload} />
           </div>
 
-          {/* Message Area */}
+          {/* Mensagem e Otimização */}
           <div className="space-y-3">
-            <div className="flex justify-between items-center px-1">
-              <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Conteúdo da Mensagem</label>
+            <div className="flex justify-between items-end ml-1">
+              <label className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">Conteúdo do SMS</label>
               <button 
-                onClick={handleOptimize}
-                disabled={isOptimizing || !message}
-                className="flex items-center gap-1.5 text-[10px] font-bold text-blue-400 hover:text-blue-300 transition-colors disabled:opacity-30"
+                onClick={async () => {
+                  setIsOptimizing(true);
+                  const opt = await optimizeMessage(message, "Vendas");
+                  if(opt) setMessage(opt.optimizedMessage);
+                  setIsOptimizing(false);
+                }}
+                disabled={!message || isOptimizing}
+                className="flex items-center gap-1.5 text-[10px] font-black text-blue-500 hover:text-blue-400 disabled:opacity-30 transition-all bg-blue-500/5 px-3 py-1.5 rounded-full border border-blue-500/20"
               >
-                <Sparkles className="w-3 h-3" />
-                MELHORAR COM IA
+                <Sparkles className={`w-3 h-3 ${isOptimizing ? 'animate-spin' : ''}`} />
+                IA OTIMIZAR
               </button>
             </div>
             <textarea 
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              placeholder="Digite sua oferta... Use [Nome] para personalizar."
-              className="w-full min-h-[140px] bg-slate-800/50 border border-slate-700 rounded-2xl p-4 text-sm text-white focus:ring-2 focus:ring-blue-600 outline-none transition-all placeholder:text-slate-600"
+              placeholder="Digite sua mensagem aqui... Use [Nome] para personalizar."
+              className="w-full h-32 bg-slate-900 border border-slate-800 rounded-3xl p-5 text-sm text-white focus:ring-2 focus:ring-blue-600 outline-none transition-all placeholder:text-slate-700"
             />
           </div>
 
-          {/* Campaign Estimator & Delay */}
-          <div className="p-5 bg-slate-800/40 rounded-2xl border border-slate-800 space-y-6">
+          {/* Delay e Calculadora de Tempo */}
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-8">
             <div className="flex justify-between items-start">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2 text-blue-400">
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2 text-slate-500">
                   <Clock className="w-4 h-4" />
-                  <span className="text-[10px] font-black uppercase tracking-widest">Intervalo de Envio</span>
+                  <span className="text-[10px] font-black uppercase tracking-widest">Delay entre Disparos</span>
                 </div>
-                <p className="text-2xl font-black text-white">{delay.toFixed(1)}<span className="text-xs text-slate-500 ml-1">seg</span></p>
+                <div className="text-3xl font-black text-white">{delay.toFixed(1)}<span className="text-xs text-slate-500 font-bold ml-1">SEG</span></div>
               </div>
               
-              <div className="text-right space-y-1">
-                <div className="flex items-center justify-end gap-2 text-emerald-400">
-                  <span className="text-[10px] font-black uppercase tracking-widest">Tempo Total Estimado</span>
-                  <Info className="w-3 h-3 opacity-50" />
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-2 text-emerald-500/80">
+                  <span className="text-[10px] font-black uppercase tracking-widest">Tempo Restante</span>
+                  <Timer className="w-4 h-4" />
                 </div>
-                <p className="text-2xl font-black text-white">{calculateTotalTime().formatted}</p>
+                <div className="text-3xl font-black text-white">{campaignTime.text}</div>
               </div>
             </div>
 
             <input 
               type="range" 
-              min="1.0" 
-              max="60" 
-              step="0.5" 
+              min="2" 
+              max="120" 
+              step="1" 
               value={delay}
               onChange={(e) => setDelay(parseFloat(e.target.value))}
-              className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
+              className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
             />
-            
-            <div className="grid grid-cols-2 gap-2">
-               <div className="bg-slate-900/50 p-2 rounded-lg border border-slate-700/50">
-                  <p className="text-[9px] text-slate-500 font-bold uppercase mb-1">Custo Estimado</p>
-                  <p className="text-xs font-bold text-white">Plano SIM Local</p>
-               </div>
-               <div className="bg-slate-900/50 p-2 rounded-lg border border-slate-700/50">
-                  <p className="text-[9px] text-slate-500 font-bold uppercase mb-1">Risco de Bloqueio</p>
-                  <p className={`text-xs font-bold ${delay < 5 ? 'text-orange-500' : 'text-emerald-500'}`}>
-                    {delay < 5 ? 'Moderado' : 'Baixo'}
-                  </p>
-               </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-slate-800/50 p-3 rounded-2xl border border-slate-800 flex flex-col gap-1">
+                 <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest">Segurança do Chip</span>
+                 <span className={`text-[11px] font-black ${delay < 15 ? 'text-orange-500' : 'text-emerald-500'}`}>
+                   {delay < 15 ? 'RISCO MODERADO' : 'MÁXIMA SEGURANÇA'}
+                 </span>
+              </div>
+              <div className="bg-slate-800/50 p-3 rounded-2xl border border-slate-800 flex flex-col gap-1">
+                 <span className="text-[8px] font-black text-slate-500 uppercase tracking-widest">Total de Contatos</span>
+                 <span className="text-[11px] font-black text-white">{contacts.length} NÚMEROS</span>
+              </div>
             </div>
           </div>
 
-          {/* Send Button */}
-          <button 
-            onClick={isSending ? handleStop : runCampaign}
-            disabled={contacts.length === 0 || !message}
-            className={`w-full h-16 rounded-2xl font-black text-sm tracking-widest transition-all flex items-center justify-center gap-3 active:scale-95 disabled:opacity-50 ${
-              isSending 
-              ? 'bg-red-500/10 text-red-500 border border-red-500/30' 
-              : 'bg-blue-600 text-white shadow-[0_8px_30px_rgba(37,99,235,0.3)]'
-            }`}
-          >
-            {isSending ? (
-              <>
-                <div className="w-2 h-2 bg-red-500 rounded-full animate-ping" />
-                PARAR CAMPANHA
-              </>
-            ) : (
-              <>
-                <Send className="w-5 h-5" />
-                INICIAR DISPARO EM MASSA
-              </>
-            )}
-          </button>
+          {/* Botão de Ação */}
+          <div className="flex flex-col gap-3">
+            <button 
+              onClick={isSending ? handleStop : runCampaign}
+              disabled={!message || contacts.length === 0}
+              className={`w-full h-16 rounded-3xl font-black text-sm tracking-[0.2em] transition-all flex items-center justify-center gap-3 active:scale-95 disabled:opacity-40 shadow-2xl ${
+                isSending 
+                ? 'bg-red-500/10 text-red-500 border border-red-500/30' 
+                : 'bg-blue-600 text-white shadow-blue-600/20'
+              }`}
+            >
+              {isSending ? (
+                <>
+                  <div className="w-2.5 h-2.5 bg-red-500 rounded-full animate-ping" />
+                  CANCELAR ENVIO
+                </>
+              ) : (
+                <>
+                  <Zap className="w-5 h-5 fill-current" />
+                  INICIAR PRÓXIMO NÍVEL
+                </>
+              )}
+            </button>
 
-          {/* Real-time Status */}
+            {/* Atalho para Reenvio se houver falhas */}
+            {!isSending && stats.failed > 0 && (
+              <button 
+                onClick={resendFailed}
+                className="w-full h-12 rounded-2xl bg-orange-500/10 text-orange-500 border border-orange-500/30 font-black text-[11px] tracking-widest hover:bg-orange-500/20 transition-all flex items-center justify-center gap-2"
+              >
+                <RefreshCw className="w-4 h-4" />
+                REENVIAR {stats.failed} MENSAGENS COM FALHA
+              </button>
+            )}
+          </div>
+
+          {/* Monitor de Progresso */}
           {(isSending || logs.length > 0) && (
-            <div className="bg-slate-800/60 p-5 rounded-2xl border border-blue-500/20 shadow-xl space-y-4">
+            <div className="bg-slate-900 border border-blue-600/20 p-6 rounded-3xl shadow-2xl space-y-6">
               <div className="flex justify-between items-center">
-                 <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Monitor de Progresso</h3>
-                 <span className="text-[10px] font-bold text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded uppercase">
-                   {isSending ? 'Processando' : 'Finalizado'}
+                 <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Monitoramento em Tempo Real</h3>
+                 <span className="text-[9px] font-black text-blue-500 bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20">
+                   {isSending ? 'EM CURSO' : 'CAMPANHA ENCERRADA'}
                  </span>
               </div>
 
-              <div className="relative h-2 bg-slate-700 rounded-full overflow-hidden">
+              <div className="relative h-3 bg-slate-800 rounded-full overflow-hidden">
                 <div 
-                  className="h-full bg-blue-500 transition-all duration-500 shadow-[0_0_10px_#3b82f6]"
+                  className="h-full bg-blue-600 transition-all duration-700 ease-out shadow-[0_0_20px_rgba(37,99,235,0.4)]"
                   style={{ width: `${(stats.sent / stats.total) * 100}%` }}
                 />
               </div>
 
-              <div className="grid grid-cols-3 gap-4">
-                <div className="text-center p-2 bg-slate-900/40 rounded-xl border border-slate-700/30">
-                  <p className="text-[8px] font-bold text-slate-500 uppercase mb-1">Enviados</p>
-                  <p className="text-sm font-black text-white">{stats.sent}</p>
+              <div className="grid grid-cols-3 gap-2">
+                <div className="text-center p-3 bg-slate-800/30 rounded-2xl border border-slate-800/50">
+                  <p className="text-[8px] font-bold text-slate-500 uppercase mb-1">Sucesso</p>
+                  <p className="text-lg font-black text-emerald-500">{stats.sent}</p>
                 </div>
-                <div className="text-center p-2 bg-slate-900/40 rounded-xl border border-slate-700/30">
+                <div className="text-center p-3 bg-slate-800/30 rounded-2xl border border-slate-800/50">
                   <p className="text-[8px] font-bold text-slate-500 uppercase mb-1">Falhas</p>
-                  <p className="text-sm font-black text-red-500">{stats.failed}</p>
+                  <p className="text-lg font-black text-red-500">{stats.failed}</p>
                 </div>
-                <div className="text-center p-2 bg-slate-900/40 rounded-xl border border-slate-700/30">
-                  <p className="text-[8px] font-bold text-slate-500 uppercase mb-1">Restantes</p>
-                  <p className="text-sm font-black text-blue-400">{stats.remaining}</p>
+                <div className="text-center p-3 bg-slate-800/30 rounded-2xl border border-slate-800/50">
+                  <p className="text-[8px] font-bold text-slate-500 uppercase mb-1">Fila</p>
+                  <p className="text-lg font-black text-blue-400">{stats.remaining}</p>
                 </div>
               </div>
             </div>
@@ -316,41 +355,62 @@ const App: React.FC = () => {
       )}
 
       {activeTab === 'history' && (
-        <div className="p-4 space-y-4">
+        <div className="space-y-6 pb-10">
           <div className="flex justify-between items-center px-1">
-             <h2 className="text-sm font-black text-white uppercase tracking-widest">Log de Disparos</h2>
-             <button className="p-2 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors">
-               <Download className="w-4 h-4 text-slate-400" />
-             </button>
+             <h2 className="text-sm font-black text-white uppercase tracking-widest">Relatório de Entrega</h2>
+             <div className="flex gap-2">
+                {stats.failed > 0 && (
+                  <button 
+                    onClick={resendFailed}
+                    disabled={isSending}
+                    className="p-2 bg-orange-500/10 text-orange-500 border border-orange-500/20 rounded-lg hover:bg-orange-500/20 transition-all flex items-center gap-2 text-[10px] font-black"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isSending ? 'animate-spin' : ''}`} />
+                    REENVIAR FALHAS
+                  </button>
+                )}
+                <button className="p-2 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors">
+                  <Download className="w-4 h-4 text-slate-400" />
+                </button>
+             </div>
           </div>
           
-          <div className="space-y-2">
+          <div className="space-y-3">
             {logs.length === 0 ? (
-              <div className="p-12 text-center opacity-40">
-                <History className="w-12 h-12 mx-auto mb-4" />
-                <p className="text-xs font-bold uppercase tracking-widest">Nenhum envio registrado</p>
+              <div className="p-20 text-center opacity-30 flex flex-col items-center">
+                <History className="w-12 h-12 mb-4" />
+                <p className="text-xs font-black uppercase tracking-widest">Nenhum dado de envio disponível</p>
               </div>
             ) : (
               logs.map((log) => (
-                <div key={log.id} className="p-3 bg-slate-800/40 border border-slate-800 rounded-xl flex items-center justify-between group hover:border-slate-700 transition-all">
-                  <div className="flex items-center gap-3">
-                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                      log.status === DeliveryStatus.SENT ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'
+                <div key={log.id} className={`p-4 bg-slate-900 border rounded-2xl flex items-center justify-between group transition-all ${
+                  log.status === DeliveryStatus.FAILED ? 'border-red-500/30 bg-red-500/5' : 'border-slate-800 hover:border-slate-700'
+                }`}>
+                  <div className="flex items-center gap-4">
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${
+                      log.status === DeliveryStatus.SENT ? 'bg-emerald-500/10 text-emerald-500' : 
+                      log.status === DeliveryStatus.PENDING ? 'bg-blue-500/10 text-blue-500' :
+                      'bg-red-500/10 text-red-500'
                     }`}>
-                      {log.status === DeliveryStatus.SENT ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+                      {log.status === DeliveryStatus.SENT && <CheckCircle2 className="w-5 h-5" />}
+                      {log.status === DeliveryStatus.FAILED && <AlertCircle className="w-5 h-5" />}
+                      {log.status === DeliveryStatus.PENDING && <RefreshCw className="w-5 h-5 animate-spin" />}
                     </div>
                     <div>
-                      <p className="text-xs font-black text-white leading-none">{log.recipient}</p>
-                      <p className="text-[10px] text-slate-500 mt-1">{log.timestamp}</p>
+                      <p className="text-xs font-black text-white leading-none tracking-tight">{log.recipient}</p>
+                      <p className="text-[10px] text-slate-500 mt-1 font-bold uppercase">{log.timestamp}</p>
                     </div>
                   </div>
                   <div className="text-right">
-                    <span className={`text-[9px] font-black uppercase tracking-tighter ${
-                      log.status === DeliveryStatus.SENT ? 'text-emerald-500' : 'text-red-500'
+                    <span className={`text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded ${
+                      log.status === DeliveryStatus.SENT ? 'text-emerald-500 bg-emerald-500/10' : 
+                      log.status === DeliveryStatus.FAILED ? 'text-red-500 bg-red-500/10' :
+                      'text-blue-500 bg-blue-500/10'
                     }`}>
-                      {log.status}
+                      {log.status === DeliveryStatus.SENT ? 'SUCESSO' : 
+                       log.status === DeliveryStatus.PENDING ? 'ENVIANDO...' : 'FALHA'}
                     </span>
-                    <p className="text-[9px] text-slate-600 max-w-[80px] truncate mt-0.5">{log.message}</p>
+                    <p className="text-[9px] text-slate-600 max-w-[120px] truncate mt-1.5 font-medium">{log.message}</p>
                   </div>
                 </div>
               ))
@@ -360,36 +420,9 @@ const App: React.FC = () => {
       )}
 
       {activeTab === 'settings' && (
-        <div className="p-6 space-y-6">
-          <h2 className="text-sm font-black text-white uppercase tracking-widest">Configurações do Sistema</h2>
-          
-          <div className="space-y-4">
-            <div className="p-4 bg-slate-800/40 rounded-2xl border border-slate-800">
-              <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Conectividade</h3>
-              <div className="flex items-center justify-between p-3 bg-slate-900/50 rounded-xl border border-slate-700/50">
-                <div className="flex items-center gap-3">
-                   <Smartphone className="w-5 h-5 text-blue-500" />
-                   <div>
-                      <p className="text-xs font-bold text-white">Chip SIM Integrado</p>
-                      <p className="text-[9px] text-slate-500">Via Google Web Messages</p>
-                   </div>
-                </div>
-                <div className="px-2 py-0.5 bg-emerald-500/10 rounded text-[9px] font-black text-emerald-500">CONECTADO</div>
-              </div>
-            </div>
-
-            <div className="p-4 bg-slate-800/40 rounded-2xl border border-slate-800">
-              <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Suporte IA</h3>
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-slate-300">Otimizador Gemini 3.0</span>
-                <span className="text-[9px] font-black text-blue-500">ATIVO</span>
-              </div>
-            </div>
-
-            <button className="w-full p-4 text-xs font-black text-red-500 hover:bg-red-500/5 rounded-2xl transition-all border border-transparent hover:border-red-500/20">
-              ENCERRAR SESSÃO OPERACIONAL
-            </button>
-          </div>
+        <div className="flex flex-col items-center justify-center py-20 opacity-30">
+          <Info className="w-12 h-12 mb-4" />
+          <p className="text-xs font-black uppercase tracking-widest">Em Breve no Próximo Nível</p>
         </div>
       )}
     </Layout>
