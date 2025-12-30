@@ -1,0 +1,8 @@
+{
+  "name": "PROXIMO NÍVEL SMS",
+  "description": "Plataforma avançada de gestão de SMS em massa com integração visual ao Google Messages e otimização por IA.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
